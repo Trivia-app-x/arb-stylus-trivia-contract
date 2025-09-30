@@ -38,9 +38,11 @@ crate-type = ["lib", "cdylib"]
 [profile.release]
 codegen-units = 1
 strip = true
-lto = true
+lto = "fat"
 panic = "abort"
+overflow-checks = false
+debug = false
+debug-assertions = false
 
-# If you need to reduce the binary size, it is advisable to try other
-# optimization levels, such as "s" and "z"
-opt-level = 3
+# Using 's' for smaller binary size with better performance balance
+opt-level = "s"

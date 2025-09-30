@@ -6,7 +6,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use stylus_sdk::{
-    alloy_primitives::{U256, U8, Address, FixedBytes},
+    alloy_primitives::{Address, FixedBytes, U256, U8},
     alloy_sol_types::sol,
     prelude::*,
 };
@@ -15,9 +15,7 @@ sol_storage! {
     #[entrypoint]
     pub struct TriviaChain {
         mapping(uint256 => GameSession) sessions;
-        mapping(address => PlayerStats) player_stats;
         uint256 next_session_id;
-        uint256 active_sessions_count;
         address owner;
     }
 
@@ -25,20 +23,17 @@ sol_storage! {
         uint256 session_id;
         address host;
         bytes32 room_code;
-        uint8 status; // 0: Created, 1: Active, 2: Completed, 3: Cancelled
+        uint8 status; // 0: Created, 1: Active, 2: Completed
         uint256 start_time;
-        uint256 end_time;
-        uint256 question_count;
         uint256 current_question_index;
         uint256 question_start_time;
-        uint256 question_duration; // in seconds
+        uint256 question_duration;
         mapping(address => Player) players;
         address[] player_list;
         uint256 player_count;
         uint256 max_players;
-        uint256 prize_pool;
         address winner;
-        mapping(uint256 => QuestionData) questions;
+        uint256 winning_score;
         mapping(uint256 => mapping(address => Answer)) answers;
     }
 
@@ -47,40 +42,19 @@ sol_storage! {
         bytes32 display_name;
         uint256 score;
         uint256 current_streak;
-        uint256 best_streak;
         uint256 correct_answers;
-        uint256 total_response_time; // cumulative response time in milliseconds
         bool is_active;
-        uint256 join_time;
-        uint8 rank;
-    }
-
-    pub struct PlayerStats {
-        uint256 games_played;
-        uint256 total_wins;
-        uint256 total_score;
-        uint256 best_score;
-        uint256 total_correct_answers;
-        uint256 longest_streak;
-    }
-
-    pub struct QuestionData {
-        bytes32 question_hash; // Hash of the question for integrity
-        uint8 question_type; // 0: Multiple choice, 1: True/False, 2: Numeric
-        uint8 difficulty; // 0: Easy, 1: Medium, 2: Hard
-        uint256 time_limit; // in seconds
-        bytes32 correct_answer_hash; // Hash of correct answer
     }
 
     pub struct Answer {
         bytes32 answer_hash;
-        uint256 submit_time; // timestamp when answer was submitted
+        uint256 submit_time;
         bool is_correct;
         uint256 points_earned;
     }
 }
 
-#[derive(SolidityError)]
+#[derive(SolidityError, Debug)]
 pub enum TriviaChainError {
     Unauthorized(Unauthorized),
     SessionNotFound(SessionNotFound),
@@ -93,24 +67,65 @@ pub enum TriviaChainError {
     InvalidQuestionIndex(InvalidQuestionIndex),
     QuestionNotActive(QuestionNotActive),
     AlreadyAnswered(AlreadyAnswered),
-    InvalidAnswer(InvalidAnswer),
-    InsufficientPrize(InsufficientPrize),
 }
 
 sol! {
+    #[derive(Debug)]
     error Unauthorized();
+    #[derive(Debug)]
     error SessionNotFound();
+    #[derive(Debug)]
     error SessionAlreadyActive();
+    #[derive(Debug)]
     error SessionNotActive();
+    #[derive(Debug)]
     error SessionFull();
+    #[derive(Debug)]
     error PlayerNotInSession();
+    #[derive(Debug)]
     error PlayerAlreadyJoined();
+    #[derive(Debug)]
     error InvalidRoomCode();
+    #[derive(Debug)]
     error InvalidQuestionIndex();
+    #[derive(Debug)]
     error QuestionNotActive();
+    #[derive(Debug)]
     error AlreadyAnswered();
-    error InvalidAnswer();
-    error InsufficientPrize();
+
+    event SessionCreated(
+        uint256 indexed sessionId,
+        address indexed host,
+        bytes32 roomCode,
+        uint256 maxPlayers,
+        uint64 timestamp
+    );
+
+    event PlayerJoined(
+        uint256 indexed sessionId,
+        address indexed player,
+        uint256 playerCount
+    );
+
+    event SessionStarted(
+        uint256 indexed sessionId,
+        address indexed host,
+        uint64 startTime
+    );
+
+    event AnswerSubmitted(
+        uint256 indexed sessionId,
+        address indexed player,
+        uint256 pointsEarned
+    );
+
+    event SessionEnded(
+        uint256 indexed sessionId,
+        address indexed winner,
+        uint256 winningScore,
+        uint256 totalPlayers,
+        uint64 endTime
+    );
 }
 
 #[public]
@@ -132,6 +147,7 @@ impl TriviaChain {
     ) -> Result<U256, TriviaChainError> {
         let session_id = self.next_session_id.get();
         let session_host = self.vm().msg_sender();
+        let session_timestamp = self.vm().block_timestamp();
         let mut session = self.sessions.setter(session_id);
 
         session.session_id.set(session_id);
@@ -144,7 +160,17 @@ impl TriviaChain {
         session.current_question_index.set(U256::ZERO);
 
         self.next_session_id.set(session_id + U256::from(1));
-        self.active_sessions_count.set(self.active_sessions_count.get() + U256::from(1));
+
+        log(
+            self.vm(),
+            SessionCreated {
+                sessionId: session_id,
+                host: session_host,
+                roomCode: room_code,
+                maxPlayers: max_players,
+                timestamp: session_timestamp,
+            },
+        );
 
         Ok(session_id)
     }
@@ -156,9 +182,7 @@ impl TriviaChain {
         display_name: FixedBytes<32>,
     ) -> Result<(), TriviaChainError> {
         let player_address = self.vm().msg_sender();
-        let session_timestamp = self.vm().block_timestamp();
 
-        // Read all session data first
         let session = self.sessions.getter(session_id);
         let room_code_check = session.room_code.get();
         let status_check = session.status.get();
@@ -166,13 +190,14 @@ impl TriviaChain {
         let max_players_check = session.max_players.get();
         let is_active_check = session.players.getter(player_address).is_active.get();
 
-        // Perform all checks
         if room_code_check != room_code {
             return Err(TriviaChainError::InvalidRoomCode(InvalidRoomCode {}));
         }
 
         if status_check != U8::from(0) {
-            return Err(TriviaChainError::SessionAlreadyActive(SessionAlreadyActive {}));
+            return Err(TriviaChainError::SessionAlreadyActive(
+                SessionAlreadyActive {},
+            ));
         }
 
         if player_count_check >= max_players_check {
@@ -180,10 +205,11 @@ impl TriviaChain {
         }
 
         if is_active_check {
-            return Err(TriviaChainError::PlayerAlreadyJoined(PlayerAlreadyJoined {}));
+            return Err(TriviaChainError::PlayerAlreadyJoined(
+                PlayerAlreadyJoined {},
+            ));
         }
 
-        // Now do mutations
         let mut session_mut = self.sessions.setter(session_id);
         let mut player = session_mut.players.setter(player_address);
 
@@ -191,21 +217,27 @@ impl TriviaChain {
         player.display_name.set(display_name);
         player.score.set(U256::ZERO);
         player.current_streak.set(U256::ZERO);
-        player.best_streak.set(U256::ZERO);
         player.correct_answers.set(U256::ZERO);
-        player.total_response_time.set(U256::ZERO);
         player.is_active.set(true);
-        player.join_time.set(U256::from(session_timestamp));
 
         session_mut.player_list.push(player_address);
-        session_mut.player_count.set(player_count_check + U256::from(1));
+        let new_player_count = player_count_check + U256::from(1);
+        session_mut.player_count.set(new_player_count);
+
+        log(
+            self.vm(),
+            PlayerJoined {
+                sessionId: session_id,
+                player: player_address,
+                playerCount: new_player_count,
+            },
+        );
 
         Ok(())
     }
 
     pub fn start_session(&mut self, session_id: U256) -> Result<(), TriviaChainError> {
         let session = self.sessions.getter(session_id);
-
         let session_host = self.vm().msg_sender();
         let session_timestamp = self.vm().block_timestamp();
 
@@ -214,12 +246,24 @@ impl TriviaChain {
         }
 
         if session.status.get() != U8::from(0) {
-            return Err(TriviaChainError::SessionAlreadyActive(SessionAlreadyActive {}));
+            return Err(TriviaChainError::SessionAlreadyActive(
+                SessionAlreadyActive {},
+            ));
         }
 
         let mut session_mut = self.sessions.setter(session_id);
         session_mut.status.set(U8::from(1)); // Active
         session_mut.start_time.set(U256::from(session_timestamp));
+
+        // Emit SessionStarted event
+        log(
+            self.vm(),
+            SessionStarted {
+                sessionId: session_id,
+                host: session_host,
+                startTime: session_timestamp,
+            },
+        );
 
         Ok(())
     }
@@ -228,21 +272,14 @@ impl TriviaChain {
         &mut self,
         session_id: U256,
         question_index: U256,
-        question_hash: FixedBytes<32>,
-        question_type: U8,
-        difficulty: U8,
-        correct_answer_hash: FixedBytes<32>,
     ) -> Result<(), TriviaChainError> {
         let session_host = self.vm().msg_sender();
         let session_timestamp = self.vm().block_timestamp();
 
-        // Read all session data first
         let session = self.sessions.getter(session_id);
         let host_check = session.host.get();
         let status_check = session.status.get();
-        let question_duration = session.question_duration.get();
 
-        // Perform checks
         if host_check != session_host {
             return Err(TriviaChainError::Unauthorized(Unauthorized {}));
         }
@@ -251,18 +288,11 @@ impl TriviaChain {
             return Err(TriviaChainError::SessionNotActive(SessionNotActive {}));
         }
 
-        // Now do mutations
         let mut session_mut = self.sessions.setter(session_id);
-        let mut question = session_mut.questions.setter(question_index);
-
-        question.question_hash.set(question_hash);
-        question.question_type.set(question_type);
-        question.difficulty.set(difficulty);
-        question.time_limit.set(question_duration);
-        question.correct_answer_hash.set(correct_answer_hash);
-
         session_mut.current_question_index.set(question_index);
-        session_mut.question_start_time.set(U256::from(session_timestamp));
+        session_mut
+            .question_start_time
+            .set(U256::from(session_timestamp));
 
         Ok(())
     }
@@ -272,41 +302,39 @@ impl TriviaChain {
         session_id: U256,
         question_index: U256,
         answer_hash: FixedBytes<32>,
+        correct_answer_hash: FixedBytes<32>,
+        difficulty: U8,
     ) -> Result<U256, TriviaChainError> {
         let player_address = self.vm().msg_sender();
         let session_timestamp = self.vm().block_timestamp();
         let current_time = U256::from(session_timestamp);
 
-        // Read all session data first
         let session = self.sessions.getter(session_id);
         let status_check = session.status.get();
         let current_question_check = session.current_question_index.get();
         let question_start = session.question_start_time.get();
         let time_limit = session.question_duration.get();
 
-        // Check session and question status
         if status_check != U8::from(1) {
             return Err(TriviaChainError::SessionNotActive(SessionNotActive {}));
         }
 
         if current_question_check != question_index {
-            return Err(TriviaChainError::InvalidQuestionIndex(InvalidQuestionIndex {}));
+            return Err(TriviaChainError::InvalidQuestionIndex(
+                InvalidQuestionIndex {},
+            ));
         }
 
-        // Read player data
         let player = session.players.getter(player_address);
         let is_active_check = player.is_active.get();
         let player_current_streak = player.current_streak.get();
-        let player_best_streak = player.best_streak.get();
         let player_correct_answers = player.correct_answers.get();
         let player_score = player.score.get();
-        let player_total_response_time = player.total_response_time.get();
 
         if !is_active_check {
             return Err(TriviaChainError::PlayerNotInSession(PlayerNotInSession {}));
         }
 
-        // Check if already answered - need to handle the temporary value
         let answers_getter = session.answers.getter(question_index);
         let existing_submit_time = answers_getter.getter(player_address).submit_time.get();
 
@@ -318,18 +346,12 @@ impl TriviaChain {
             return Err(TriviaChainError::QuestionNotActive(QuestionNotActive {}));
         }
 
-        // Read question data
-        let question = session.questions.getter(question_index);
-        let correct_answer_hash = question.correct_answer_hash.get();
-        let difficulty = question.difficulty.get();
-
         let is_correct = answer_hash == correct_answer_hash;
 
         // Calculate points
         let response_time = current_time - question_start;
         let time_bonus = if response_time < time_limit {
-            let bonus_ratio = (time_limit - response_time) * U256::from(50) / time_limit;
-            bonus_ratio
+            (time_limit - response_time) * U256::from(50) / time_limit
         } else {
             U256::ZERO
         };
@@ -341,50 +363,50 @@ impl TriviaChain {
         };
 
         let difficulty_multiplier = if difficulty == U8::ZERO {
-            U256::from(100) // Easy: 1x
-        } else if difficulty == U8::from(1) {
-            U256::from(150) // Medium: 1.5x
-        } else if difficulty == U8::from(2) {
-            U256::from(200) // Hard: 2x
-        } else {
             U256::from(100)
+        } else if difficulty == U8::from(1) {
+            U256::from(150)
+        } else {
+            U256::from(200)
         };
 
         let mut points = (base_points + time_bonus) * difficulty_multiplier / U256::from(100);
 
-        // Calculate new streak
         let new_streak = if is_correct {
             player_current_streak + U256::from(1)
         } else {
             U256::ZERO
         };
 
-        // Add streak bonus
         if is_correct && new_streak >= U256::from(2) {
             let streak_bonus = new_streak * U256::from(10);
             points = points + streak_bonus;
         }
 
-        // Now do all mutations
+        // Update player data
         let mut session_mut = self.sessions.setter(session_id);
         let mut player_mut = session_mut.players.setter(player_address);
 
         if is_correct {
             player_mut.current_streak.set(new_streak);
-
-            if new_streak > player_best_streak {
-                player_mut.best_streak.set(new_streak);
-            }
-
-            player_mut.correct_answers.set(player_correct_answers + U256::from(1));
+            player_mut
+                .correct_answers
+                .set(player_correct_answers + U256::from(1));
         } else {
             player_mut.current_streak.set(U256::ZERO);
         }
 
         player_mut.score.set(player_score + points);
-        player_mut.total_response_time.set(player_total_response_time + response_time);
 
-        // Record answer - need to handle the temporary value
+        // Update winner if this player now has highest score
+        let current_winning_score = session_mut.winning_score.get();
+        let new_total_score = player_score + points;
+        if new_total_score > current_winning_score {
+            session_mut.winner.set(player_address);
+            session_mut.winning_score.set(new_total_score);
+        }
+
+        // Record answer
         let mut answers_setter = session_mut.answers.setter(question_index);
         let mut answer = answers_setter.setter(player_address);
         answer.answer_hash.set(answer_hash);
@@ -392,19 +414,25 @@ impl TriviaChain {
         answer.is_correct.set(is_correct);
         answer.points_earned.set(points);
 
+        log(
+            self.vm(),
+            AnswerSubmitted {
+                sessionId: session_id,
+                player: player_address,
+                pointsEarned: points,
+            },
+        );
+
         Ok(points)
     }
 
+    // Simplified end_session - no loops!
     pub fn end_session(&mut self, session_id: U256) -> Result<Address, TriviaChainError> {
         let session_timestamp = self.vm().block_timestamp();
-
-        // Read all session data first
         let session = self.sessions.getter(session_id);
         let host_check = session.host.get();
         let status_check = session.status.get();
-        let player_count = session.player_list.len();
 
-        // Check authorization
         if host_check != self.vm().msg_sender() {
             return Err(TriviaChainError::Unauthorized(Unauthorized {}));
         }
@@ -413,109 +441,39 @@ impl TriviaChain {
             return Err(TriviaChainError::SessionNotActive(SessionNotActive {}));
         }
 
-        // Find winner and collect all player data
-        let mut highest_score = U256::ZERO;
-        let mut winner_address = Address::ZERO;
-        let mut player_data = Vec::new();
+        // Winner is already tracked during gameplay
+        let winner_address = session.winner.get();
+        let winning_score = session.winning_score.get();
+        let player_count = session.player_count.get();
 
-        for i in 0..player_count {
-            let player_address = session.player_list.get(i).unwrap();
-            let player = session.players.getter(player_address);
-            let player_score = player.score.get();
-            let player_correct = player.correct_answers.get();
-            let player_best_streak = player.best_streak.get();
-
-            player_data.push((player_address, player_score, player_correct, player_best_streak));
-
-            if player_score > highest_score {
-                highest_score = player_score;
-                winner_address = player_address;
-            }
-        }
-
-        // Update session status
         let mut session_mut = self.sessions.setter(session_id);
         session_mut.status.set(U8::from(2)); // Completed
-        session_mut.end_time.set(U256::from(session_timestamp));
-        session_mut.winner.set(winner_address);
 
-        // Update winner stats
-        if winner_address != Address::ZERO {
-            let winner_total_wins = self.player_stats.getter(winner_address).total_wins.get();
-            let mut winner_stats = self.player_stats.setter(winner_address);
-            winner_stats.total_wins.set(winner_total_wins + U256::from(1));
-        }
-
-        // Update all player stats
-        for (player_address, player_score, player_correct, player_best_streak) in player_data {
-            // Read existing stats
-            let stats_getter = self.player_stats.getter(player_address);
-            let games_played = stats_getter.games_played.get();
-            let total_score = stats_getter.total_score.get();
-            let best_score = stats_getter.best_score.get();
-            let total_correct = stats_getter.total_correct_answers.get();
-            let longest_streak = stats_getter.longest_streak.get();
-
-            // Update stats
-            let mut stats = self.player_stats.setter(player_address);
-            stats.games_played.set(games_played + U256::from(1));
-            stats.total_score.set(total_score + player_score);
-
-            if player_score > best_score {
-                stats.best_score.set(player_score);
-            }
-
-            stats.total_correct_answers.set(total_correct + player_correct);
-
-            if player_best_streak > longest_streak {
-                stats.longest_streak.set(player_best_streak);
-            }
-        }
-
-        // Update active sessions count
-        let active_count = self.active_sessions_count.get();
-        self.active_sessions_count.set(active_count - U256::from(1));
+        log(
+            self.vm(),
+            SessionEnded {
+                sessionId: session_id,
+                winner: winner_address,
+                winningScore: winning_score,
+                totalPlayers: player_count,
+                endTime: session_timestamp,
+            },
+        );
 
         Ok(winner_address)
     }
 
-    pub fn get_session_info(&self, session_id: U256) -> (Address, U8, U256, U256, Address) {
-        let session = self.sessions.getter(session_id);
-        (
-            session.host.get(),
-            session.status.get(),
-            session.player_count.get(),
-            session.current_question_index.get(),
-            session.winner.get(),
-        )
+    // View functions
+    pub fn get_winner(&self, session_id: U256) -> Address {
+        self.sessions.getter(session_id).winner.get()
     }
 
     pub fn get_player_score(&self, session_id: U256, player: Address) -> U256 {
-        self.sessions.getter(session_id).players.getter(player).score.get()
-    }
-
-    pub fn get_player_stats(&self, player: Address) -> (U256, U256, U256, U256) {
-        let stats = self.player_stats.getter(player);
-        (
-            stats.games_played.get(),
-            stats.total_wins.get(),
-            stats.best_score.get(),
-            stats.longest_streak.get(),
-        )
-    }
-
-    pub fn get_leaderboard(&self, session_id: U256) -> Vec<(Address, U256)> {
-        let session = self.sessions.getter(session_id);
-        let mut leaderboard = Vec::new();
-
-        for i in 0..session.player_list.len() {
-            let player_address = session.player_list.get(i).unwrap();
-            let player = session.players.getter(player_address);
-            leaderboard.push((player_address, player.score.get()));
-        }
-
-        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
-        leaderboard
+        self.sessions
+            .getter(session_id)
+            .players
+            .getter(player)
+            .score
+            .get()
     }
 }
-
