@@ -34,7 +34,6 @@ sol_storage! {
         uint256 max_players;
         address winner;
         uint256 winning_score;
-        mapping(uint256 => mapping(address => Answer)) answers;
     }
 
     pub struct Player {
@@ -44,13 +43,6 @@ sol_storage! {
         uint256 current_streak;
         uint256 correct_answers;
         bool is_active;
-    }
-
-    pub struct Answer {
-        bytes32 answer_hash;
-        uint256 submit_time;
-        bool is_correct;
-        uint256 points_earned;
     }
 }
 
@@ -64,8 +56,6 @@ pub enum TriviaChainError {
     PlayerNotInSession(PlayerNotInSession),
     PlayerAlreadyJoined(PlayerAlreadyJoined),
     InvalidRoomCode(InvalidRoomCode),
-    InvalidQuestionIndex(InvalidQuestionIndex),
-    QuestionNotActive(QuestionNotActive),
     AlreadyAnswered(AlreadyAnswered),
 }
 
@@ -86,10 +76,6 @@ sol! {
     error PlayerAlreadyJoined();
     #[derive(Debug)]
     error InvalidRoomCode();
-    #[derive(Debug)]
-    error InvalidQuestionIndex();
-    #[derive(Debug)]
-    error QuestionNotActive();
     #[derive(Debug)]
     error AlreadyAnswered();
 
@@ -113,18 +99,19 @@ sol! {
         uint64 startTime
     );
 
-    event AnswerSubmitted(
-        uint256 indexed sessionId,
-        address indexed player,
-        uint256 pointsEarned
-    );
-
     event SessionEnded(
         uint256 indexed sessionId,
         address indexed winner,
         uint256 winningScore,
         uint256 totalPlayers,
         uint64 endTime
+    );
+
+    event FinalScoreSubmitted(
+        uint256 indexed sessionId,
+        address indexed player,
+        uint256 score,
+        uint256 correctAnswers
     );
 }
 
@@ -297,133 +284,60 @@ impl TriviaChain {
         Ok(())
     }
 
-    pub fn submit_answer(
+    pub fn submit_final_score(
         &mut self,
         session_id: U256,
-        question_index: U256,
-        answer_hash: FixedBytes<32>,
-        correct_answer_hash: FixedBytes<32>,
-        difficulty: U8,
-    ) -> Result<U256, TriviaChainError> {
+        total_score: U256,
+        correct_answers: U256,
+    ) -> Result<(), TriviaChainError> {
         let player_address = self.vm().msg_sender();
-        let session_timestamp = self.vm().block_timestamp();
-        let current_time = U256::from(session_timestamp);
 
         let session = self.sessions.getter(session_id);
         let status_check = session.status.get();
-        let current_question_check = session.current_question_index.get();
-        let question_start = session.question_start_time.get();
-        let time_limit = session.question_duration.get();
 
-        if status_check != U8::from(1) {
+        // Check session is ended (status = 2)
+        if status_check != U8::from(2) {
             return Err(TriviaChainError::SessionNotActive(SessionNotActive {}));
-        }
-
-        if current_question_check != question_index {
-            return Err(TriviaChainError::InvalidQuestionIndex(
-                InvalidQuestionIndex {},
-            ));
         }
 
         let player = session.players.getter(player_address);
         let is_active_check = player.is_active.get();
-        let player_current_streak = player.current_streak.get();
-        let player_correct_answers = player.correct_answers.get();
-        let player_score = player.score.get();
+        let current_score = player.score.get();
 
         if !is_active_check {
             return Err(TriviaChainError::PlayerNotInSession(PlayerNotInSession {}));
         }
 
-        let answers_getter = session.answers.getter(question_index);
-        let existing_submit_time = answers_getter.getter(player_address).submit_time.get();
-
-        if existing_submit_time != U256::ZERO {
+        // Only allow one final submission per player
+        if current_score > U256::ZERO {
             return Err(TriviaChainError::AlreadyAnswered(AlreadyAnswered {}));
         }
 
-        if current_time > question_start + time_limit {
-            return Err(TriviaChainError::QuestionNotActive(QuestionNotActive {}));
-        }
-
-        let is_correct = answer_hash == correct_answer_hash;
-
-        // Calculate points
-        let response_time = current_time - question_start;
-        let time_bonus = if response_time < time_limit {
-            (time_limit - response_time) * U256::from(50) / time_limit
-        } else {
-            U256::ZERO
-        };
-
-        let base_points = if is_correct {
-            U256::from(100)
-        } else {
-            U256::ZERO
-        };
-
-        let difficulty_multiplier = if difficulty == U8::ZERO {
-            U256::from(100)
-        } else if difficulty == U8::from(1) {
-            U256::from(150)
-        } else {
-            U256::from(200)
-        };
-
-        let mut points = (base_points + time_bonus) * difficulty_multiplier / U256::from(100);
-
-        let new_streak = if is_correct {
-            player_current_streak + U256::from(1)
-        } else {
-            U256::ZERO
-        };
-
-        if is_correct && new_streak >= U256::from(2) {
-            let streak_bonus = new_streak * U256::from(10);
-            points = points + streak_bonus;
-        }
-
-        // Update player data
+        // Update player's final score
         let mut session_mut = self.sessions.setter(session_id);
         let mut player_mut = session_mut.players.setter(player_address);
 
-        if is_correct {
-            player_mut.current_streak.set(new_streak);
-            player_mut
-                .correct_answers
-                .set(player_correct_answers + U256::from(1));
-        } else {
-            player_mut.current_streak.set(U256::ZERO);
-        }
+        player_mut.score.set(total_score);
+        player_mut.correct_answers.set(correct_answers);
 
-        player_mut.score.set(player_score + points);
-
-        // Update winner if this player now has highest score
+        // Update winner if this player has highest score
         let current_winning_score = session_mut.winning_score.get();
-        let new_total_score = player_score + points;
-        if new_total_score > current_winning_score {
+        if total_score > current_winning_score {
             session_mut.winner.set(player_address);
-            session_mut.winning_score.set(new_total_score);
+            session_mut.winning_score.set(total_score);
         }
-
-        // Record answer
-        let mut answers_setter = session_mut.answers.setter(question_index);
-        let mut answer = answers_setter.setter(player_address);
-        answer.answer_hash.set(answer_hash);
-        answer.submit_time.set(current_time);
-        answer.is_correct.set(is_correct);
-        answer.points_earned.set(points);
 
         log(
             self.vm(),
-            AnswerSubmitted {
+            FinalScoreSubmitted {
                 sessionId: session_id,
                 player: player_address,
-                pointsEarned: points,
+                score: total_score,
+                correctAnswers: correct_answers,
             },
         );
 
-        Ok(points)
+        Ok(())
     }
 
     // Simplified end_session - no loops!
